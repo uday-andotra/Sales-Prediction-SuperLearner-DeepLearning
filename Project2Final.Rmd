@@ -1,0 +1,500 @@
+---
+title: "Project2"
+author: "Jennifer Nasirumbi"
+date: "2024-12-17"
+output: html_document
+---
+
+```{r load data}
+# Install necessary packages if not already installed
+#install.packages(c("SuperLearner", "caret", "glmnet", "rpart", "ranger", "xgboost", #"earth", "e1071", "nnet", "MASS", "kknn"))
+
+# Load libraries
+library(SuperLearner); library(caret); library(glmnet); library(rpart)
+library(ranger); library(xgboost); library(earth); library(e1071)
+library(MASS); library(kknn); library(party)   # For Conditional Inference Trees (ctree)
+library(nnet)                   # For Neural Networks
+library(randomForest); library(kernlab); library(cvAUC); library(psych)
+
+rm(list=ls()) # clear out the memory and refresh,flush all those variables not being used anymore
+# Check current working directory
+getwd()
+# If necessary, set the working directory to where the files are located
+setwd(".")
+
+# Load the training dataset (pex23train.RDS)
+load("hospitalUSA.R")
+
+```
+
+
+```{r transformations}
+# Initialize C variable as NULL
+hospitalUSA$C <- NULL
+
+# Assuming 'df' is your data frame and it contains 'Sales' and other features
+# Step 1: Create the Group Variable C
+hospitalUSA$C <- ifelse(hospitalUSA$SALES > 0, 1, 0)  # C = 1 if Sales > 0, else C = 0
+
+# Step 2: Define X (features) and Y (target)
+X <- hospitalUSA[, !names(hospitalUSA) %in% c("C")]  # Exclude Sales and C columns
+Y <- hospitalUSA$C  # Target variable is C
+
+z = X[,-c(1:4,10,13:15)]
+names(z)
+
+
+transgap=function(z,alpha=0.5) {
+  x=z[!is.na(z)]
+  library("moments")
+  signch = F
+  ### Errors for negative values
+  if(all(x<=0)) {x = -x; signch = T}
+  mx=min(x)
+  if(mx < 0) x= x-mx  else mx=0
+  
+  ############################################################
+  ### Extra functions gap and skew and incorporating Transatan
+  ###gap function
+  gap= function(x) if(any(x==0))  if(all(x>=0)| all(x<=0))
+  min(abs(x)[x!=0])/sd(x[x!=0]) else 0 else 0
+  ###skewness function
+  skew=function(x) if(min(x)>=0)skewness(x[x>0]) else  
+  if(max(x)<=0) skewness(x[x<0]) else skewness(x)
+  ###added the transatan function with the arcTan transformation
+  transatan= function(x) atan(x/median(x[x>0]))
+  
+  ####augmented the values of 𝑐 and 𝑝 as follows
+  p0=c(2, 1,0.75, 0.5, 0.25,0.1,-0.1, -0.25, -0.5,-0.75, -1, -2)
+c0=c(0.0001,0.001,0.01,0.05,0.1,0.2,0.3,0.4,0.5,0.75,1,2,5,10,20,100,500,1000,10000)
+  y=NULL
+  res=NULL
+  if(min(x)==0) ad0=1 else ad0=0
+  #increased the count on i to include additional values of p0
+  #added the transatan function in addition to the skew and gap 
+  #functions
+  for(i in p0[1:6]) {
+    ###implementing the 𝑥^𝑝 power transformation
+    u= (x^i); y=cbind(y,u)
+    res=cbind(res,c(skew(u),gap(u),transatan(u),i)) }
+  for(i in p0[-(1:6)]) {
+    ###implementing the -(𝑥+ 1) ^ -p power transformation
+    u= -(x+ad0)^i ; y=cbind(y,u)
+    res=cbind(res,c(skew(1+u),gap(1+u),transatan(i+u),i)) }
+  for(i in c0) {
+    ###implementing the 𝑙𝑜𝑔(1+𝑐𝑥), log transformation
+    u= log(1+i*x) ; y=cbind(y,u)
+    res=cbind(res,c(skew(u),gap(u),transatan(u),i)) }
+  # alpha=0.75
+  #browser()
+  if(min(res[2,])>alpha) {alpha= min(res[2,]); cat("Warning there may be a gap at 0\n")}
+  res[1,res[2,]>alpha]= res[1,res[2,]>alpha]+1000000
+  i=which.min(abs(res[1,]))
+  str=  if(i<=3) paste("x^",res[3,i],sep="") else
+    if(i<=7) paste("-(x+",ad0,")^",res[3,i],sep="") else
+      paste("log(1+x*",res[3,i],")",sep="")
+  z[!is.na(z)] = y[,i]
+  list( x=z,trans=str,SignChange=signch,ShiftNegative=mx)
+}
+
+
+```
+
+
+```{r transformations plots}
+
+ztrans0 = sapply(z,function(x)transgap(x)$x)
+
+##########
+# convert ztrans0 to a data frame or matrix
+# convert Y to a vector
+class(Y)   # Make sure it's a vector
+class(ztrans0)  # Make sure it's a data frame or matrix
+ztrans0 <- as.data.frame(ztrans0)  # If it's not already a data frame
+Y <- as.vector(Y)
+
+##########
+#merge transformed data ztrans0 with untransformed variables using row ID and create a #region variable based on state
+z2 = X[,c(13:15,10,1:4)]
+names(z2)
+
+# If row IDs are already aligned, use cbind (assuming the number of rows match)
+X_transformed <- cbind(ztrans0, z2)
+
+# Example data: Assume merged_data has a 'state' column
+library(dplyr)
+
+# Create a region variable based on the state
+X_transformed <- X_transformed %>%
+  mutate(region = case_when(
+    STATE %in% c("ME", "NH", "VT", "MA", "RI", "CT", "NY", "NJ", "PA") ~ "Northeast",
+    STATE %in% c("OH", "IN", "IL", "MI", "WI", "MO", "IA", "MN", "ND", "SD", "NE", "KS") ~ "Midwest",
+    STATE %in% c("DE", "MD", "VA", "WV", "NC", "SC", "GA", "FL", "AL", "TN", "KY", "MS", 
+                 "AR", "LA", "OK", "TX") ~ "South",
+    STATE %in% c("MT", "WY", "CO", "NM", "AZ", "ID", "UT", "NV", "CA", "OR", "WA", "AK", "HI") ~ "West",
+    TRUE ~ "Other" # In case there is an unknown state code
+  ))
+
+# View the result
+head(X_transformed)
+all_transformed <- cbind(X_transformed,Y)
+
+##########
+par(mfrow=c(1,2), mar=c(4,4,1,1))
+for(i in 1:10) { 
+  hist(z[[i]],30,col=7,main=names(z)[i],xlab=names(z)[i])
+  hist(ztrans0[,i],30,col=7,main=paste("Transgap",names(z)[i]),xlab=names(z)[i])
+}
+
+
+
+```
+
+```{r superlearner for the complete dataset}
+# Fit the SuperLearner Model
+learners <- c(
+  "SL.glm",        # Generalized Linear Model
+  "SL.randomForest", # Random Forest
+  "SL.svm",        # Support Vector Machine
+  "SL.ranger",        # K-Nearest Neighbors
+  "SL.nnet",       # Neural Network
+  "SL.gam"           # MARS (Multivariate Adaptive Regression Splines) from the 'earth' 
+)
+
+
+# Set up the SuperLearner model for the original data
+sl_model_nt <- SuperLearner(
+  Y = all_transformed$Y,                  # Response variable
+  X = hospitalUSA[,-c(1:4,10)],   # Predictors (assuming the transformed X is used)
+  family = binomial(),            # Specify the family (binomial for binary outcomes)
+  SL.library = learners,          # List of learners/models to use in the ensemble
+  cvControl = list(V=10)         # Number of folds for cross-validation
+)
+
+# Print the results of the SuperLearner model (including cross-validation)
+print(sl_model_nt)
+
+
+
+
+# Set up the SuperLearner model for the transformed data
+sl_model <- SuperLearner(
+  Y = all_transformed$Y,                          # Response variable
+  X = all_transformed[, 1:13],      # Predictors (assuming the transformed X is used)
+  family = binomial(),            # Specify the family (binomial for binary outcomes)
+  SL.library = learners,          # List of learners/models to use in the ensemble
+  cvControl = list(V=10)         # Number of folds for cross-validation
+)
+
+# Print the results of the SuperLearner model (including cross-validation)
+print(sl_model)
+
+
+####################################
+# Load the necessary libraries
+library(caret)  # For confusion matrix
+# Assuming sl_model is your trained SuperLearner model and Y contains the true labels
+# Get the predicted probabilities (use the SuperLearner object directly for predictions)
+pred_probs <- predict.SuperLearner(sl_model, X = all_transformed[, 1:13], Y = all_transformed$Y, onlySL = TRUE)$pred
+
+# Convert the predicted probabilities to binary class predictions using a threshold of 0.5
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+
+# Compute the confusion matrix comparing predicted vs true labels
+confusion <- confusionMatrix(as.factor(pred_class), as.factor(Y))
+
+# Print the confusion matrix
+print(confusion)
+table(Y)
+
+
+##################
+# Extract the coefficients from the three models
+coef_sl_model <- sl_model$coef
+
+# Create a data frame to store the coefficients from all three models
+coef_df <- data.frame(
+  Model = names(coef_sl_model),  # Repeating model names for each coefficient set
+  Coefficient = c(coef_sl_model),  # Concatenating coefficients
+  ModelType = rep(c("base superlearner"), each = length(coef_sl_model))  # Model labels
+)
+
+# Load ggplot2 for plotting
+library(ggplot2)
+
+# Create the plot
+ggplot(coef_df, aes(x = reorder(Model, Coefficient), y = Coefficient, fill = ModelType)) +
+  geom_bar(stat = "identity", position = "dodge") +  # Bar plot with dodged bars for comparison
+  coord_flip() +  # Flip the axes for better readability
+  labs(title = "Coefficients from SuperLearner Model", 
+       x = "Model", 
+       y = "Coefficient") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for readability
+        legend.position = "top")  # Position legend at the top
+
+
+#######################
+pred_probs_nt <- predict.SuperLearner(sl_model_nt, X = all_transformed[, 1:13], Y = all_transformed$Y, onlySL = TRUE)$pred
+
+# Convert the predicted probabilities to binary class predictions using a threshold of 0.5
+pred_class_nt <- ifelse(pred_probs_nt > 0.5, 1, 0)
+
+# Compute the confusion matrix comparing predicted vs true labels
+confusion_nt <- confusionMatrix(as.factor(pred_class_nt), as.factor(Y))
+
+# Print the confusion matrix
+print(confusion_nt)
+table(Y)
+
+###
+# Extract the coefficients from the three models
+coef_sl_model_nt <- sl_model_nt$coef
+
+# Create a data frame to store the coefficients from all three models
+coef_df_nt <- data.frame(
+  Model = names(coef_sl_model_nt),  # Repeating model names for each coefficient set
+  Coefficient = c(coef_sl_model_nt),  # Concatenating coefficients
+  ModelType = rep(c("base superlearner"), each = length(coef_sl_model_nt))  # Model labels
+)
+
+# Load ggplot2 for plotting
+library(ggplot2)
+
+# Create the plot
+ggplot(coef_df_nt, aes(x = reorder(Model, Coefficient), y = Coefficient, fill = ModelType)) +
+  geom_bar(stat = "identity", position = "dodge") +  # Bar plot with dodged bars for comparison
+  coord_flip() +  # Flip the axes for better readability
+  labs(title = "SuperLearner Model for non transformed model", 
+       x = "Model", 
+       y = "Coefficient") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for readability
+        legend.position = "top")  # Position legend at the top
+
+
+```
+
+```{r propensity scores}
+# Get the predicted probabilities (propensity scores)
+pred_probs <- predict.SuperLearner(sl_model, X = all_transformed[, 1:13], Y = all_transformed$Y, onlySL = TRUE)$pred
+
+# Merge the predicted probabilities with the original data frame
+all_transformed$propensity_score <- pred_probs
+
+# Convert predicted probabilities to class predictions using 0.25 threshold
+pred_class <- ifelse(pred_probs > 0.25 & pred_probs < 0.75, 1, 0)
+all_transformed$pred_class <- pred_class
+
+# Filter data where pred_class = 1 and Y = 0
+SDelta <- all_transformed[all_transformed$pred_class == 1 & all_transformed$Y == 0, ]
+
+# View the first few rows of SDelta
+head(SDelta)
+
+
+
+
+```
+
+```{r propensity score plots}
+library(ggplot2)
+
+# Create the histogram for untransformed data
+hist(pred_probs_nt, 
+     main = "Histogram of Predicted Probabilities",  # Title of the histogram
+     xlab = "Predicted Probability",                  # Label for the x-axis
+     ylab = "Frequency",                              # Label for the y-axis
+     col = "lightblue",                               # Color for the bars
+     border = "black",                                # Color for the borders of the bars
+     breaks = 100,                                    # Number of bins (adjust as needed)
+     xlim = c(0, 1))                                  # Ensure x-axis spans 0 to 1 for better visibility
+
+# Highlight the range from 0.25 to 0.75
+rect(xleft = 0.25, ybottom = 0, xright = 0.75, ytop = 120, 
+     col = rgb(1, 0, 0, 0.2), border = NA)  # Red color with transparency
+
+# Add vertical line at 0.42441
+abline(v = 0.42441, col = "red", lwd = 2, lty = 2)  # Red dashed vertical line at 0.42441
+
+
+###################
+
+
+# Create the histogram
+hist(pred_probs, 
+     main = "Histogram of Predicted Probabilities",  # Title of the histogram
+     xlab = "Predicted Probability",                  # Label for the x-axis
+     ylab = "Frequency",                              # Label for the y-axis
+     col = "lightblue",                               # Color for the bars
+     border = "black",                                # Color for the borders of the bars
+     breaks = 100,                                    # Number of bins (adjust as needed)
+     xlim = c(0, 1))                                  # Ensure x-axis spans 0 to 1 for better visibility
+
+# Highlight the range from 0.25 to 0.75
+rect(xleft = 0.25, ybottom = 0, xright = 0.75, ytop = 120, 
+     col = rgb(1, 0, 0, 0.2), border = NA)  # Red color with transparency
+
+# Add vertical line at 0.42441
+abline(v = 0.42441, col = "red", lwd = 2, lty = 2)  # Red dashed vertical line at 0.42441
+
+
+###################
+ggplot(all_transformed, aes(x = propensity_score, y = SALES)) +
+  geom_point(aes(size = SALES), color = "blue", alpha = 0.6) +  # Points in blue, sized by 'SALES' with transparency
+  labs(
+    title = "Scatter Plot of Propensity Score vs Sales",
+    x = "Propensity Score",  # Label for x-axis
+    y = "Sales",             # Label for y-axis
+    size = "Sales"           # Label for size legend
+  ) +
+  theme_minimal()  # Clean, minimal theme
+
+
+##########################
+ggplot(all_transformed, aes(x = propensity_score, y = factor(Y))) +
+  geom_point(aes(color = factor(Y)), alpha = 0.6, size = 2) +  # Scatter plot with points
+  labs(
+    title = "Scatter Plot of Propensity Score by True Outcome",
+    x = "Propensity Score",  # Label for x-axis
+    y = "True Outcome (C)",  # Label for y-axis
+    color = "True Outcome (C)"
+  ) +
+  theme_minimal() +  # Clean, minimal theme
+  annotate("rect", xmin = 0.25, xmax = 0.75, ymin = -Inf, ymax = Inf, 
+           fill = "red", alpha = 0.2) +  # Red rectangle with transparency
+  geom_vline(xintercept = 0.42441, linetype = "dashed", color = "red", linewidth = 0.5)  # Red vertical line at x = 0.42441
+
+
+
+
+```
+
+```{r factor analysis}
+
+ff <- fa(all_transformed[, 1:13], nfactors=10, rotate = "oblimin")
+print(ff)
+ff1 <-  fa(all_transformed[, 1:13], nfactors=2, rotate = "oblimin")
+print(ff1)
+fa.diagram(ff1)
+
+
+```
+
+```{r variable importance}
+seedValue = 123
+set.seed(seedValue)
+rf_model <- randomForest(x = all_transformed[, 1:13], y = all_transformed$Y, importance = TRUE, ntree = 500)
+
+# Get variable importance
+var_imp <- importance(rf_model)
+
+# Sort and display importance
+var_imp_df <- data.frame(Variable = rownames(var_imp), Importance = var_imp[, 1])
+var_imp_df <- var_imp_df %>% arrange(desc(Importance))
+
+# Show top variables
+print(var_imp_df)
+
+
+```
+
+
+
+# H2O DEEP LEARNING MODEL
+```{r h20DeepLearning, echo=TRUE}
+seed <- seedValue
+propScore = as.vector(all_transformed$propensity_score)
+
+# Assign customers and non-customers datasets
+hospitalUSACustData = all_transformed[, -c(19, 21,22 )]
+hospitalUSACustData$propensity_score = propScore
+
+# customers <- hospitalUSA[hospitalUSA$C == 1, ]
+# non_customers <- hospitalUSA[hospitalUSA$C == 0, ]
+
+customers <- hospitalUSACustData[hospitalUSACustData$Y == 1, ]
+non_customers <- hospitalUSACustData[hospitalUSACustData$Y == 0, ]
+
+
+# Split customer data into training and testing sets
+#library(caret)
+set.seed(seed)
+data_split <- createDataPartition(customers$SALES, p = 0.8, list = FALSE)
+training_data <- customers[data_split, ]
+testing_data <- customers[-data_split, ]
+
+# Initialize H20
+library(h2o)
+h2o.init()
+
+# format data for H2O processing
+train_dl <- as.h2o(training_data)
+test_dl <- as.h2o(testing_data)
+
+# Define features and target
+target <- "SALES"
+features <- setdiff(names(customers), c(target, "HID", "ZIP", "CITY", "STATE"))
+# deep learning training model with CV
+h20DlModel <- h2o.deeplearning(
+  x = features,
+  y = target,
+  training_frame = train_dl,
+  validation_frame = test_dl,
+  activation = "RectifierWithDropout",
+  hidden = c(64, 32, 16),
+  epochs = 50,
+  nfolds = 5,
+  seed = seed
+)
+
+# Evaluate model performance
+perf <- h2o.performance(h20DlModel, newdata = test_dl)
+h2o.rmse(perf)
+
+# Predict sales for non-customers who satisfy the propensity score criterion
+selectedNonCust =  non_customers[non_customers$propensity_score >= 0.35 & non_customers$propensity_score <= 0.65,]
+potentialCust = selectedNonCust[, -c(20)]
+potentialCust_h2o <- as.h2o(potentialCust)
+predictions <- h2o.predict(h20DlModel, newdata = potentialCust_h2o)
+
+# Append predicted sales to non-customer data
+results <- as.data.frame(potentialCust)
+results$Predicted_SALES <- as.vector(predictions)
+
+# Sort hospitals (potential customers) by Predicted sales
+top_rank_hospitals <- results[order(-results$Predicted_SALES), ]
+selected_hospitals <- head(top_rank_hospitals, 10)
+
+# Potential sales gain is predicted sales, as prior sales==0
+selected_hospitals$Potential_Gain <- selected_hospitals$Predicted_SALES
+
+# Display results
+print(selected_hospitals[, c("HID", "ZIP", "CITY", "STATE", "Predicted_SALES", "Potential_Gain")])
+
+```
+
+```{r summarizeDeepLearner}
+summary(h20DlModel)
+```
+# Top ten Potential customers
+```{r TopPotential_customers, echo=TRUE}
+
+ggplot(selected_hospitals, aes(x = reorder(CITY, Predicted_SALES), y = Predicted_SALES)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = round(Predicted_SALES, 1)), hjust = -0.2) + coord_flip() +
+  labs(title = "Top Potential Customer Hospitals with largest Predicted Sales", x = "City", y = "Predicted Sales") +
+  theme_minimal()
+
+```
+
+
+
+# Potential Sales to current non-customers group arranged by State desc
+```{r stateSales}
+state_sales <- rowsum(top_rank_hospitals$Predicted_SALES, group = top_rank_hospitals$STATE)
+state_sales <- state_sales[order(-state_sales[, 1]), , drop = FALSE]
+head(state_sales, 10) 
+```
+
+
